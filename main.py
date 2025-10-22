@@ -6,13 +6,15 @@ from pymongo import MongoClient
 from dotenv import load_dotenv
 import os
 
-# Load environment variables
-load_dotenv()
+# ----------------------------
+# LOAD ENV VARIABLES
+# ----------------------------
+load_dotenv()  # Loads .env file locally
 
 app = FastAPI()
 
 # ----------------------------
-# ROOT ENDPOINT (to fix 404 on Render)
+# ROOT ENDPOINT
 # ----------------------------
 @app.get("/")
 def home():
@@ -25,35 +27,36 @@ def home():
     })
 
 # ----------------------------
-# DATABASE CONNECTION (robust init)
+# MONGO CONNECTION
 # ----------------------------
-messages_col = None
-
 mongo_uri = os.getenv("MONGO_URI", "").strip()
+
 if not mongo_uri:
-    print("⚠️  MONGO_URI not set; continuing without DB (messages won't be saved)")
-elif not mongo_uri.startswith(("mongodb://", "mongodb+srv://")):
-    print("❌ Invalid MONGO_URI format. Must start with 'mongodb://' or 'mongodb+srv://'. Continuing without DB.")
-else:
-    try:
-        mongo_client = MongoClient(mongo_uri)
-        db = mongo_client["chatbot_db"]
-        messages_col = db["messages"]
-        print("✅ MongoDB connected successfully!")
-    except Exception as e:
-        print(f"❌ MongoDB connection failed: {e}. Continuing without DB.")
+    raise ValueError("❌ MONGO_URI not found in environment variables. Set it in .env or Render Environment Variables.")
+
+messages_col = None
+try:
+    mongo_client = MongoClient(mongo_uri)
+    db = mongo_client["chatbot_db"]
+    messages_col = db["messages"]
+    # Verify connection
+    mongo_client.admin.command('ping')
+    print("✅ MongoDB connected successfully!")
+except Exception as e:
+    print(f"❌ MongoDB connection failed: {e}")
+    messages_col = None
 
 # ----------------------------
 # GROQ CLIENT SETUP
 # ----------------------------
 groq_api_key = os.getenv("GROQ_API_KEY")
 if not groq_api_key:
-    raise ValueError("❌ GROQ_API_KEY not found in environment")
+    raise ValueError("❌ GROQ_API_KEY not found in environment variables")
 
-groq_client = Groq(api_key=groq_api_key)
+client = Groq(api_key=groq_api_key)
 
 # ----------------------------
-# WHATSAPP WEBHOOK ENDPOINT
+# WHATSAPP WEBHOOK
 # ----------------------------
 @app.post("/webhook")
 async def whatsapp_webhook(
@@ -61,11 +64,13 @@ async def whatsapp_webhook(
     From: str = Form(...),
     Body: str = Form(...)
 ):
-    """Handles incoming WhatsApp messages from Twilio"""
     user_message = Body.strip()
     user_number = From
 
-    if messages_col is not None:
+    print(f"📩 Incoming message from {user_number}: {user_message}")
+
+    # Save user message
+    if messages_col:
         try:
             messages_col.insert_one({
                 "user": user_number,
@@ -76,18 +81,23 @@ async def whatsapp_webhook(
             print(f"⚠️  Failed to write incoming message to MongoDB: {e}")
 
     # Generate AI reply using LLaMA 3.1
-    completion = groq_client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[
-            {"role": "system", "content": "You are a helpful WhatsApp chatbot assistant."},
-            {"role": "user", "content": user_message}
-        ],
-        temperature=0.6
-    )
+    try:
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "system", "content": "You are a helpful WhatsApp chatbot assistant."},
+                {"role": "user", "content": user_message}
+            ],
+            temperature=0.6
+        )
+        # Correct property access for the latest SDK
+        bot_reply = completion.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"❌ Error generating Groq reply: {e}")
+        bot_reply = "Sorry, I ran into an issue. Please try again later."
 
-    bot_reply = completion.choices[0].message["content"]
-
-    if messages_col is not None:
+    # Save bot reply
+    if messages_col:
         try:
             messages_col.insert_one({
                 "user": user_number,
@@ -101,5 +111,5 @@ async def whatsapp_webhook(
     twilio_resp = MessagingResponse()
     twilio_resp.message(bot_reply)
 
-    # Ensure Twilio gets proper XML content type
+    print(f"🤖 Replied to {user_number}: {bot_reply}")
     return Response(content=str(twilio_resp), media_type="application/xml")
